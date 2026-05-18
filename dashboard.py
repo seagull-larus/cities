@@ -77,7 +77,13 @@ def load_and_prep_data():
     weights = {c: w / total_w for c, w in weights.items()}
     
     # 3. Расчет взвешенного интегрального индекса Env Score (шкала от 0 до 100)
-    df_full['env_score'] = sum(df_full[c] * weights[c] for c in norm_cols) * 100
+    raw_score = sum(df_full[c] * weights[c] for c in norm_cols)
+
+    # 2. Растягиваем его так, чтобы худший результат стал 0, а лучший — 100
+    score_min = raw_score.min()
+    score_max = raw_score.max()
+    
+    df_full['env_score'] = ((raw_score - score_min) / (score_max - score_min)) * 100
     
     # Сортировка и создание лагов для ML-модели
     df_full = df_full.sort_values(['city', 'year'])
