@@ -8,36 +8,78 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 
-
 st.set_page_config(page_title="Устойчивость городской среды", layout="wide")
 
+# Списки признаков по направлению их влияния на городскую среду
+STIMULATORS = [
+    'people', 'net_salary', 'birth', 'preschool_child', 'length_of_roads',
+    'energy_consumption', 'migration_net', 'housing_stock', 'wage', 'workers', 'housing_price'
+]
+
+DESTIMULATORS = [
+    'air_general_level', 'avg_age', 'ilm', 'crimes', 'criminals', 'death', 'pens', 'poverty_level'
+]
 
 @st.cache_data
 def load_and_prep_data():
     df_full = pd.read_csv('after_interpolation.csv', encoding='utf-8-sig')
     
-    feature_columns = [
-        'people', 'air_general_level', 'net_salary', 'avg_age', 'ilm', 'birth',
-        'crimes', 'criminals', 'death', 'pens', 'preschool_child', 'length_of_roads',
-        'energy_consumption', 'migration_net', 'housing_stock', 'wage', 'workers',
-        'poverty_level', 'housing_price'
-    ]
-    
-    feature_columns = [col for col in feature_columns if col in df_full.columns]
+    # Собираем только те колонки, которые реально есть в датасете
+    feature_columns = [col for col in (STIMULATORS + DESTIMULATORS) if col in df_full.columns]
     
     scalers = {}
     norm_cols = []
     
+    # 1. Нормирование с учетом характера влияния признака
     for col in feature_columns:
         if df_full[col].notna().sum() > 0:
             scaler = MinMaxScaler()
             norm_name = f'{col}_norm'
-            df_full[norm_name] = scaler.fit_transform(df_full[[col]])
+            
+            # Базовая нормировка от 0 до 1
+            scaled_vals = scaler.fit_transform(df_full[[col]]).flatten()
+            
+            # Если признак негативный (дестимулятор) — инвертируем его (1 - x)
+            if col in DESTIMULATORS:
+                df_full[norm_name] = 1.0 - scaled_vals
+            else:
+                df_full[norm_name] = scaled_vals
+                
             scalers[col] = scaler
             norm_cols.append(norm_name)
             
-    df_full['env_score'] = df_full[norm_cols].mean(axis=1)
+    # 2. Настройка весов признаков (Сумма должна быть равна 1.0)
+    # Задаем экспертные веса для ключевых метрик, влияющих на устойчивость
+    custom_weights = {
+        'poverty_level_norm': 0.12,
+        'crimes_norm': 0.12,
+        'air_general_level_norm': 0.10,
+        'net_salary_norm': 0.08,
+        'wage_norm': 0.08,
+        'birth_norm': 0.08,
+        'death_norm': 0.08,
+    }
     
+    weights = {}
+    # Распределяем остаток весов равномерно между остальными признаками
+    missing_cols = [c for c in norm_cols if c not in custom_weights]
+    current_sum = sum(custom_weights.get(c, 0) for c in norm_cols if c in custom_weights)
+    remainder = max(0.0, 1.0 - current_sum)
+    
+    for c in norm_cols:
+        if c in custom_weights:
+            weights[c] = custom_weights[c]
+        else:
+            weights[c] = remainder / len(missing_cols) if missing_cols else 0
+            
+    # На всякий случай жестко нормализуем веса в сумму 1.0
+    total_w = sum(weights.values())
+    weights = {c: w / total_w for c, w in weights.items()}
+    
+    # 3. Расчет взвешенного интегрального индекса Env Score (шкала от 0 до 100)
+    df_full['env_score'] = sum(df_full[c] * weights[c] for c in norm_cols) * 100
+    
+    # Сортировка и создание лагов для ML-модели
     df_full = df_full.sort_values(['city', 'year'])
     for col in norm_cols + ['env_score']:
         df_full[f'lag_{col}'] = df_full.groupby('city')[col].shift(1)
@@ -45,7 +87,7 @@ def load_and_prep_data():
     lag_cols = [f'lag_{col}' for col in norm_cols + ['env_score']]
     df_lagged = df_full.dropna(subset=lag_cols)
     
-    return df_full, df_lagged, scalers, norm_cols, lag_cols, feature_columns
+    return df_full, df_lagged, scalers, norm_cols, lag_cols, feature_columns, weights
 
 @st.cache_resource
 def train_models(_df_lagged, lag_cols):
@@ -65,21 +107,24 @@ def train_models(_df_lagged, lag_cols):
     
     return rf, lr, rf_r2, lr_r2
 
-df_full, df_lagged, scalers, norm_cols, lag_cols, feature_columns = load_and_prep_data()
+# Загрузка данных и обучение моделей
+df_full, df_lagged, scalers, norm_cols, lag_cols, feature_columns, weights = load_and_prep_data()
 rf, lr, rf_r2, lr_r2 = train_models(df_lagged, lag_cols)
 
+# Интерфейс Streamlit
 st.title("🏙️ AI-Оценка устойчивости городской среды")
-st.markdown("Дэшборд для мониторинга и прогнозирования интегрального индекса устойчивости городов (Env Score).")
+st.markdown("Дэшборд для мониторинга и прогнозирования интегрального взвешенного индекса устойчивости городов (Env Score по шкале 0-100).")
 
 latest_year = int(df_full['year'].max())
 df_latest = df_full[df_full['year'] == latest_year]
 avg_score = df_latest['env_score'].mean()
 top_city = df_latest.loc[df_latest['env_score'].idxmax()]
 
+# Главные метрики
 col1, col2, col3, col4 = st.columns(4)
 col1.metric(label="Анализируемых городов", value=len(df_latest))
-col2.metric(label=f"Средний Env Score ({latest_year})", value=f"{avg_score:.3f}")
-col3.metric(label="Лидер рейтинга", value=top_city['city'], delta=f"{top_city['env_score']:.3f}")
+col2.metric(label=f"Средний Env Score ({latest_year})", value=f"{avg_score:.2f}")
+col3.metric(label="Лидер рейтинга", value=top_city['city'], delta=f"{top_city['env_score']:.2f}")
 col4.metric(label="Точность прогноза (RF R²)", value=f"{rf_r2:.2f}")
 
 st.divider()
@@ -92,12 +137,12 @@ with tab1:
     col_a, col_b = st.columns(2)
     with col_a:
         top_15 = df_latest.nlargest(15, 'env_score').sort_values('env_score', ascending=True)
-        fig_top = px.bar(top_15, x='env_score', y='city', orientation='h', title="Лидеры", color='env_score', color_continuous_scale='Greens')
+        fig_top = px.bar(top_15, x='env_score', y='city', orientation='h', title="Лидеры устойчивости", color='env_score', color_continuous_scale='Greens')
         st.plotly_chart(fig_top, use_container_width=True)
         
     with col_b:
         bottom_15 = df_latest.nsmallest(15, 'env_score').sort_values('env_score', ascending=False)
-        fig_bottom = px.bar(bottom_15, x='env_score', y='city', orientation='h', title="Аутсайдеры", color='env_score', color_continuous_scale='Reds')
+        fig_bottom = px.bar(bottom_15, x='env_score', y='city', orientation='h', title="Аутсайдеры (Зоны риска)", color='env_score', color_continuous_scale='Reds')
         st.plotly_chart(fig_bottom, use_container_width=True)
 
 with tab2:
@@ -113,15 +158,15 @@ with tab2:
             st.plotly_chart(fig_trend, use_container_width=True)
             
     with col_d:
-        st.subheader("Важность признаков (Random Forest)")
+        st.subheader("Важность признаков для предиктивной модели (Random Forest)")
         imp = pd.DataFrame({'Feature': lag_cols, 'Importance': rf.feature_importances_}).sort_values('Importance', ascending=True)
         imp['Feature'] = imp['Feature'].str.replace('lag_', '').str.replace('_norm', '')
         fig_imp = px.bar(imp.tail(10), x='Importance', y='Feature', orientation='h', color='Importance', color_continuous_scale='Blues')
         st.plotly_chart(fig_imp, use_container_width=True)
 
 with tab3:
-    st.subheader("Симуляция изменений (Прогноз на следующий год)")
-    st.markdown("Изменяйте базовые показатели города, чтобы увидеть, как ML-модель пересчитает рейтинг устойчивости.")
+    st.subheader("Симуляция изменений (Прогноз на следующий период)")
+    st.markdown("Изменяйте базовые показатели города, чтобы увидеть, как ML-модель пересчитает рейтинг устойчивости с учетом весов и инверсии негативных факторов.")
     
     col_e, col_f = st.columns([1, 2])
     
@@ -141,26 +186,36 @@ with tab3:
         
     with col_f:
         if st.button("Рассчитать AI-прогноз"):
-            new_norm = scalers[target_feature].transform([[new_val]])[0, 0]
+            # Нормируем новое значение через сохраненный MinMaxScaler
+            raw_norm = scalers[target_feature].transform([[new_val]])[0, 0]
+            
+            # Корректно инвертируем, если это негативный фактор
+            if target_feature in DESTIMULATORS:
+                new_norm = 1.0 - raw_norm
+            else:
+                new_norm = raw_norm
             
             X_new = {}
             new_norm_values = []
             
+            # Формируем измененный лаговый вектор для прогноза
             for c in norm_cols:
                 original_feature = c.replace('_norm', '')
                 if original_feature == target_feature:
                     X_new[f'lag_{c}'] = new_norm
-                    new_norm_values.append(new_norm)
+                    new_norm_values.append(new_norm * weights[c])
                 else:
                     X_new[f'lag_{c}'] = base_data[c]
-                    new_norm_values.append(base_data[c])
+                    new_norm_values.append(base_data[c] * weights[c])
             
-            new_env = sum(new_norm_values) / len(norm_cols)
+            # Рассчитываем взвешенный лаговый env_score по шкале 0-100
+            new_env = sum(new_norm_values) * 100
             X_new['lag_env_score'] = new_env
             
             df_pred = pd.DataFrame([X_new])
             pred_rf_new = rf.predict(df_pred)[0]
             
+            # Формируем базовый лаговый вектор (без изменений)
             X_base = {f'lag_{c}': base_data[c] for c in norm_cols}
             X_base['lag_env_score'] = base_data['env_score']
             pred_rf_base = rf.predict(pd.DataFrame([X_base]))[0]
@@ -170,10 +225,17 @@ with tab3:
             st.success("Прогноз успешно сгенерирован!")
             
             m1, m2, m3 = st.columns(3)
-            m1.metric("Текущий Env Score", f"{base_data['env_score']:.4f}")
-            m2.metric("Базовый прогноз (без изм.)", f"{pred_rf_base:.4f}")
-            m3.metric("Новый AI-Прогноз", f"{pred_rf_new:.4f}", delta=f"{diff:+.4f}")
+            m1.metric("Текущий Env Score", f"{base_data['env_score']:.2f}")
+            m2.metric("Базовый прогноз (без изм.)", f"{pred_rf_base:.2f}")
+            m3.metric("Новый AI-Прогноз", f"{pred_rf_new:.2f}", delta=f"{diff:+.2f}")
             
-            st.info(f"💡 Изменение показателя `{target_feature}` на {percent_change}% приводит к изменению интегрального индекса устойчивости на {diff:+.4f} пунктов в следующем периоде.")
+            # Динамическая подсказка в зависимости от типа признака
+            is_destimulator = target_feature in DESTIMULATORS
+            behavior = "снижение" if is_destimulator else "рост"
+            if percent_change < 0:
+                behavior = "рост" if is_destimulator else "снижение"
+                
+            st.info(f"💡 Изменение показателя `{target_feature}` на {percent_change}% означает {behavior} качества среды. "
+                    f"Это приводит к изменению прогнозного индекса устойчивости на {diff:+.2f} пунктов.")
 
-st.caption("Данные подготовлены на основе датасета after_interpolation.csv")
+st.caption("Данные подготовлены на основе датасета after_interpolation.csv с применением взвешенной эколого-социальной нормировки.")
